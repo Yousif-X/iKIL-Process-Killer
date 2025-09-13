@@ -1,0 +1,113 @@
+# But in your ~/.basrc or ~/.zshrc
+ikil() {
+  # Check dependencies first (fzf + bat are must-haves)
+  for cmd in ps fzf bat awk sed grep xargs ls; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "Missing required command: $cmd" >&2
+      return 1
+    fi
+  done
+  
+  # Create a function that can be interrupted cleanly
+  local temp_fifo=$(mktemp -u)
+  mkfifo "$temp_fifo"
+  
+  # Background process to feed data
+  {
+    trap 'exit 0' INT TERM
+    while true; do
+      ps -eo pid,user,ppid,stat,stime,tty,time,cmd --sort=pid | sed 1d
+      # Use read with timeout instead of sleep for better signal handling
+      read -t 1 -r < /dev/null 2>/dev/null || true
+    done > "$temp_fifo"
+  } &
+  local feeder_pid=$!
+  
+  # Ensure cleanup happens
+  trap 'kill $feeder_pid 2>/dev/null; rm -f "$temp_fifo"; trap - INT TERM; return 130' INT TERM
+  
+  cat "$temp_fifo" | fzf -m --ansi --height=80% --layout=reverse --preview-window=down:70%:wrap \
+      --color='bg+:#313244,bg:#1e1e2e,spinner:#f5e0dc,hl:#f38ba8' \
+      --color='fg:#cdd6f4,header:#f38ba8,info:#cba6f7,pointer:#f5e0dc' \
+      --color='marker:#f5e0dc,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8' \
+      --preview 'pid=$(echo {} | awk "{print \$1}"); \
+( echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+  echo "🔍 PROCESS DETAILS - PID: $pid"; \
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+  echo; \
+  if ps -p "$pid" >/dev/null 2>&1; then \
+    echo "📊 Basic Info:"; \
+    ps -p "$pid" -o pid,user,ppid,stat,stime,tty,time,cmd --no-headers 2>/dev/null | \
+    awk "{printf \"  PID: %s | User: %s | PPID: %s | Status: %s\\n  Start: %s | TTY: %s | Time: %s\\n  Command: \", \$1, \$2, \$3, \$4, \$5, \$6, \$7; for(i=8;i<=NF;i++) printf \"%s \", \$i; print \"\"}"; \
+    echo; \
+    echo "💻 Full Command Line:"; \
+    if [ -r /proc/"$pid"/cmdline ]; then \
+      cmdline=$(tr "\\0" " " < /proc/"$pid"/cmdline 2>/dev/null); \
+      if [ -n "$cmdline" ]; then \
+        echo "  $cmdline"; \
+      else \
+        echo "  [kernel thread or no cmdline available]"; \
+      fi; \
+    else \
+      echo "  [cmdline not accessible]"; \
+    fi; \
+    echo; \
+    echo "📈 Memory & CPU:"; \
+    if [ -r /proc/"$pid"/status ]; then \
+      grep -E "^(VmSize|VmRSS|VmSwap|Threads|Cpus_allowed_list):" /proc/"$pid"/status 2>/dev/null | \
+      sed "s/^/  /" || echo "  [memory info not available]"; \
+    else \
+      echo "  [status not accessible]"; \
+    fi; \
+    echo; \
+    echo "🌐 Network Connections:"; \
+    netstat_out=$(netstat -tulpn 2>/dev/null | grep " $pid/" | head -5); \
+    if [ -n "$netstat_out" ]; then \
+      echo "$netstat_out" | sed "s/^/  /"; \
+    else \
+      echo "  [no network connections found]"; \
+    fi; \
+    echo; \
+    echo "📁 Working Directory:"; \
+    if [ -r /proc/"$pid"/cwd ]; then \
+      cwd=$(readlink /proc/"$pid"/cwd 2>/dev/null || echo "[not accessible]"); \
+      echo "  $cwd"; \
+    else \
+      echo "  [cwd not accessible]"; \
+    fi; \
+    echo; \
+    echo "📂 Open File Descriptors (top 10):"; \
+    if [ -d /proc/"$pid"/fd ]; then \
+      fd_count=$(ls /proc/"$pid"/fd 2>/dev/null | wc -l); \
+      echo "  Total FDs: $fd_count"; \
+      ls -la /proc/"$pid"/fd 2>/dev/null | head -11 | tail -10 | \
+      awk "{printf \"  %s -> %s\\n\", \$9, \$11}" 2>/dev/null || echo "  [fd info not available]"; \
+    else \
+      echo "  [fd directory not accessible]"; \
+    fi; \
+    echo; \
+    echo "🔒 Process Tree Context:"; \
+    ps --forest -o pid,ppid,user,cmd -g $(ps -o pgid= -p "$pid" 2>/dev/null) 2>/dev/null | \
+    grep -E "(PID|$pid)" | head -10 | sed "s/^/  /" || echo "  [process tree not available]"; \
+  else \
+    echo "❌ Process $pid no longer exists or not accessible"; \
+  fi ) | bat --paging=never --style=plain --color=always --theme="Catppuccin Mocha"' \
+      --header ' 󰓾 = select,  = kill -15 selected PIDs' \
+  | awk '{print $1}' \
+  | while read -r pid; do
+      [ -z "$pid" ] && continue
+      if ! printf '%s' "$pid" | grep -Eq '^[0-9]+$'; then
+        echo "Skipping invalid PID: $pid" >&2
+        continue
+      fi
+      printf "Killing PID %s with SIGTERM...\n" "$pid"
+      kill -15 "$pid" 2>/dev/null \
+        || echo "Failed to kill PID $pid (permission or already gone)." >&2
+    done
+  
+  # Clean up
+  kill $feeder_pid 2>/dev/null || true
+  rm -f "$temp_fifo"
+  trap - INT TERM
+}
+alias sk='ikil'
